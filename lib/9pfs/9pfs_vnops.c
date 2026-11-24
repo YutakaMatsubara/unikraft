@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <uk/config.h>
 #include <uk/9p.h>
@@ -165,6 +166,11 @@ int uk_9pfs_allocate_vnode_data(struct vnode *vp, struct uk_9pfid *fid)
 	nd->fid = fid;
 	nd->nb_open_files = 0;
 	nd->removed = false;
+#if CONFIG_LIB9PFS_READAHEAD
+	nd->ra_buf = NULL;
+	nd->ra_off = 0;
+	nd->ra_len = 0;
+#endif
 	vp->v_data = nd;
 
 	return 0;
@@ -182,9 +188,57 @@ void uk_9pfs_free_vnode_data(struct vnode *vp)
 		uk_9p_remove(dev, nd->fid);
 
 	uk_9pfid_put(nd->fid);
+#if CONFIG_LIB9PFS_READAHEAD
+	free(nd->ra_buf);
+#endif
 	free(nd);
 	vp->v_data = NULL;
 }
+
+#if CONFIG_LIB9PFS_READAHEAD
+#define UK_9PFS_RA_SIZE ((size_t)CONFIG_LIB9PFS_READAHEAD * 1024)
+
+static void uk_9pfs_ra_drop(struct vnode *vp)
+{
+	if (vp->v_data)
+		UK_9PFS_ND(vp)->ra_len = 0;
+}
+
+/*
+ * Serve a read smaller than the read-ahead buffer from it, refilling it with
+ * one 9P read at `off` when `off` lies outside the buffered range. Returns
+ * the number of bytes copied (possibly fewer than `len`), 0 at end of file,
+ * or a negative error.
+ */
+static int64_t uk_9pfs_ra_read(struct vnode *vp, struct uk_9pdev *dev,
+			       struct uk_9pfid *fid, off_t off,
+			       size_t len, char *buf)
+{
+	struct uk_9pfs_node_data *nd = UK_9PFS_ND(vp);
+	int64_t got;
+	size_t n;
+
+	if (!nd->ra_len || off < nd->ra_off ||
+	    off >= nd->ra_off + (off_t)nd->ra_len) {
+		if (!nd->ra_buf) {
+			nd->ra_buf = malloc(UK_9PFS_RA_SIZE);
+			if (!nd->ra_buf)
+				return uk_9p_read(dev, fid, off, len, buf);
+		}
+		nd->ra_len = 0;
+		got = uk_9p_read(dev, fid, off, UK_9PFS_RA_SIZE, nd->ra_buf);
+		if (got <= 0)
+			return got;
+		nd->ra_off = off;
+		nd->ra_len = got;
+	}
+	n = nd->ra_off + nd->ra_len - off;
+	if (n > len)
+		n = len;
+	memcpy(buf, nd->ra_buf + (off - nd->ra_off), n);
+	return n;
+}
+#endif /* CONFIG_LIB9PFS_READAHEAD */
 
 static int uk_9pfs_open(struct vfscore_file *file)
 {
@@ -581,6 +635,14 @@ static int uk_9pfs_read(struct vnode *vp, struct vfscore_file *fp,
 	struct iovec *iov;
 	int64_t bytes;
 	int i = 0;
+#if CONFIG_LIB9PFS_READAHEAD
+	/* Only calls that are small as a whole use the read-ahead buffer.
+	 * musl's stdio reads a large block as two vectors (the destination,
+	 * then its own 1 KiB buffer); refilling the read-ahead buffer for that
+	 * second vector would fetch data the next seek throws away.
+	 */
+	bool ra = (size_t)uio->uio_resid < UK_9PFS_RA_SIZE;
+#endif
 
 	if (vp->v_type == VDIR)
 		return EISDIR;
@@ -600,6 +662,12 @@ static int uk_9pfs_read(struct vnode *vp, struct vfscore_file *fp,
 			continue;
 		}
 
+#if CONFIG_LIB9PFS_READAHEAD
+		if (ra)
+			bytes = uk_9pfs_ra_read(vp, dev, fid, uio->uio_offset,
+						iov->iov_len, iov->iov_base);
+		else
+#endif
 		bytes = uk_9p_read(dev, fid, uio->uio_offset,
 				   iov->iov_len, iov->iov_base);
 		if (unlikely(bytes < 0))
@@ -642,6 +710,10 @@ static int uk_9pfs_write(struct vnode *vp, struct uio *uio, int ioflag)
 
 	if (ioflag & IO_APPEND)
 		uio->uio_offset = vp->v_size;
+
+#if CONFIG_LIB9PFS_READAHEAD
+	uk_9pfs_ra_drop(vp);
+#endif
 
 	/* Clone vnode fid. */
 	fid = uk_9p_walk(dev, UK_9PFS_VFID(vp), NULL);
@@ -885,6 +957,9 @@ static int uk_9pfs_do_setattr(struct vnode *vp, struct uk_9pfid *fid,
 
 static int uk_9pfs_setattr(struct vnode *vp, struct vattr *attr)
 {
+#if CONFIG_LIB9PFS_READAHEAD
+	uk_9pfs_ra_drop(vp);
+#endif
 	return uk_9pfs_do_setattr(vp, UK_9PFS_VFID(vp), attr);
 }
 
@@ -906,6 +981,9 @@ static int uk_9pfs_fsync(struct vnode *vp, struct vfscore_file *fp)
 
 static int uk_9pfs_truncate(struct vnode *vp, off_t off)
 {
+#if CONFIG_LIB9PFS_READAHEAD
+	uk_9pfs_ra_drop(vp);
+#endif
 	return uk_9pfs_do_setattr(vp, UK_9PFS_VFID(vp), &(struct vattr){
 		.va_mask = AT_SIZE,
 		.va_size = off,

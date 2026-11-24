@@ -34,6 +34,7 @@
 #define __UK_9PFS__
 
 #include <stdbool.h>
+#include <uk/config.h>
 #include <uk/9pdev.h>
 #include <uk/9pfid.h>
 
@@ -114,6 +115,12 @@ struct uk_9pfs_node_data {
 	int                    nb_open_files;
 	/* Is a 9P remove call required when `nb_open_files` reaches 0? */
 	bool                   removed;
+#if CONFIG_LIB9PFS_READAHEAD
+	/* Read-ahead buffer: file bytes [ra_off, ra_off + ra_len) */
+	char                   *ra_buf;
+	off_t                  ra_off;
+	size_t                 ra_len;
+#endif
 };
 
 /**

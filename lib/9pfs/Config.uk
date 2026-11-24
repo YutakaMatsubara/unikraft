@@ -13,3 +13,20 @@ config LIB9PFS
 			The user name to use.
 		aname=
 			The file tree to access.
+
+config LIB9PFS_READAHEAD
+	int "Read-ahead buffer per file, in KiB (0 disables it)"
+	range 0 508
+	default 0
+	depends on LIB9PFS
+	help
+		Serve reads smaller than this buffer from a per-file buffer that
+		is filled with one 9P read, instead of sending one 9P request per
+		read. musl's stdio refills its 1 KiB buffer with a readv() of two
+		vectors, so a program parsing a file with fread() otherwise costs
+		one or two round trips to the host per KiB. Reads (whole readv()
+		calls) of the buffer size or larger bypass it. The maximum, 508,
+		is the largest 9P read the virtio-9p transport carries. The
+		buffer is dropped on write, truncate and setattr through this
+		guest; changes made on the host are not seen while the buffered
+		range stays valid (like cache=loose).
